@@ -1,13 +1,14 @@
 {
   "slug": "archive-pro",
   "name": "ArchivePro",
-  "tagline": "A multi-format archiver \u2014 zip/7z/tar/zstd with encryption and split volumes.",
+  "tagline": "A multi-format archiver — zip/7z/tar/zstd with encryption and split volumes.",
   "categorySlug": "archivers-compression",
   "license": "Apache-2.0",
   "description": "Create and extract ZIP, 7z, TAR, GZ and Zstandard archives with a familiar dual-pane browser; add AES-256 encryption and password protection, split into volumes, test integrity, and set compression levels. A capable, fully open-source 7-Zip/WinRAR alternative.",
   "aiStack": "Python (tkinter + CLI), py7zr, zstandard",
   "platforms": [
-    "windows"
+    "windows",
+    "linux"
   ],
   "buildEntry": "archive_pro_app.py"
 }
