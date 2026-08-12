@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-r"""ArchivePro -- a pure-stdlib tkinter GUI on top of the ``archivepro`` API.
+r"""ArchivePro -- an Aura (QuickOpen design system) GUI on top of the ``archivepro`` API.
 
-A single main window: a left sidebar (Browse, Create, Test) and a main panel
-that swaps to the selected view.  Every operation calls the tested core library
-(never re-implements archive logic) and runs on a background thread so the UI
-stays responsive; results are marshalled back with ``self.after`` and reported
-in a clear inline area -- a summary line on success, or the ``ArchiveError``
-message (never a raw traceback) on failure.
+A single Aura window with a sidebar of three sections: **Browse / Extract**
+(open an archive, inspect its contents in a table, extract all or the
+selection), **Create** (add files/folders, pick a format + options, build,
+optionally encrypted 7z or split into volumes) and **Test** (verify an archive
+or split set).  Every operation calls the tested core library (never
+re-implements archive logic) and runs on a background thread so the UI stays
+responsive; results are marshalled back with ``self.after`` and reported in the
+Aura status bar -- a summary line on success, or the ``ArchiveError`` message
+(never a raw traceback) on failure.
 
-Design goals baked in here:
-  * pure standard-library tkinter/ttk -- NO third-party GUI deps.  Dark mode is
-    a ttk-style + palette swap; "drag and drop" is an explicit "Add..." button.
-  * Importing this module does nothing.  Only :func:`main` builds a root window,
-    and it degrades gracefully (prints a message, returns 0) with no display.
+Design goals baked in here (mirrors the QuickOpen house style):
+  * built on the vendored ``archivepro/aura.py`` design system, which layers the
+    quickopen.ai look (deep space + light) over CustomTkinter.  Runtime deps:
+    ``customtkinter`` (+ ``darkdetect``) -- declared in requirements.txt; the
+    PyInstaller build adds ``--collect-all customtkinter``.
+  * Importing this module does nothing.  Only :func:`main` builds a root
+    window, and it degrades gracefully (prints a message, returns 0) with no
+    display or with customtkinter missing.
   * Frozen-exe safe: bundled assets are resolved via ``sys._MEIPASS`` / the exe
     directory when ``sys.frozen`` is set -- never ``__file__``.
 
@@ -25,13 +31,15 @@ import os
 import sys
 import threading
 
-# NOTE: tkinter is imported lazily inside main()/build_app so that merely
-# importing this module (e.g. during packaging or on a headless CI box) never
-# fails.
+# NOTE: tkinter/customtkinter/aura are imported lazily inside build_app()/main()
+# so that merely importing this module (e.g. during packaging or on a headless
+# CI box, or without customtkinter installed) never fails.
 
 APP_NAME = "ArchivePro"
 APP_VERSION = "1.0.0"
 WINDOW_TITLE = "ArchivePro — by QuickOpen (quickopen.ai)"
+PROJECT_URL = "https://quickopen.ai"
+ACCENT = "#b0700a"      # publish/specs/archive-pro.json "accent": [176, 112, 10]
 
 ARCHIVE_TYPES = [
     ("Archives", "*.zip *.7z *.tar *.tar.gz *.tgz *.tar.bz2 *.tar.xz *.zst *.gz"),
@@ -50,29 +58,9 @@ CREATE_FORMATS = [
     ("Gzip, single file (.gz)", "gz"),
 ]
 
-# ---- colour palettes (mirror the QuickOpen palette) -------------------------
-PALETTES = {
-    "light": {
-        "bg": "#f5f7fa", "surface": "#ffffff", "text": "#141820",
-        "muted": "#5b6472", "primary": "#2f5fe0", "primary_hi": "#2450c8",
-        "entry": "#ffffff", "border": "#d5dae2", "sel": "#2f5fe0",
-        "sel_fg": "#ffffff", "trough": "#e2e7ef", "ok": "#1f7a3d",
-        "err": "#c0392b",
-    },
-    "dark": {
-        "bg": "#0f1115", "surface": "#1a1e24", "text": "#f1f3f7",
-        "muted": "#9aa4b2", "primary": "#5b86f7", "primary_hi": "#7098ff",
-        "entry": "#1a1e24", "border": "#2a2f38", "sel": "#5b86f7",
-        "sel_fg": "#0f1115", "trough": "#2a2f38", "ok": "#5bd68a",
-        "err": "#ff6b5e",
-    },
-}
-
-VIEWS = [("browse", "Browse / Extract"), ("create", "Create"), ("test", "Test")]
-
 
 # ---------------------------------------------------------------------------
-# Asset / frozen handling
+# Asset / frozen handling  +  small OS helpers
 # ---------------------------------------------------------------------------
 def asset_path(name):
     """Locate a bundled asset from source OR a PyInstaller one-file build.
@@ -124,51 +112,79 @@ def open_in_file_manager(path):
         return False
 
 
+def open_with_default_app(path):
+    """Open a file/URL with the OS default application, guarded."""
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", path])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
-# The app (built lazily; tkinter imported only inside build_app/main)
+# The app (built lazily; tkinter/customtkinter imported only inside build_app)
 # ---------------------------------------------------------------------------
 def build_app():
-    """Construct and return the App class bound to a live tkinter import.
+    """Construct and return the App class bound to live GUI imports.
 
-    Kept inside a function so this module imports cleanly without a display.
+    Kept inside a function so this module imports cleanly without a display
+    (and without customtkinter installed).
     """
     import tkinter as tk
     from tkinter import ttk, filedialog
+    import customtkinter as ctk  # noqa: F401 - imported so ImportError surfaces here
 
-    from . import guiconfig
+    from . import aura, guiconfig
+    # archivepro/__init__ rebinds the package attributes 'create'/'extract'/
+    # 'inspect' to their FUNCTIONS, so import the callables directly rather
+    # than 'from . import create' (which would return the create() function).
     from .errors import ArchiveError
     from .create import create
     from .extract import extract
     from .inspect import list_contents, test_archive
 
-    FONT = "Segoe UI"
-
-    class App(tk.Tk):
+    class App(aura.AuraApp):
         def __init__(self):
-            super().__init__()
-            self.title(WINDOW_TITLE)
-            self.geometry("1040x660")
-            self.minsize(860, 540)
+            super().__init__(
+                title=WINDOW_TITLE, app_name=APP_NAME, accent=ACCENT,
+                theme=guiconfig.get_theme(),
+                icon_png=asset_path("archive-pro.png"), version=APP_VERSION,
+                tagline="offline archiver",
+                on_theme_change=guiconfig.set_theme,
+                size=(1040, 720), min_size=(880, 600))
 
-            self.theme = guiconfig.get_theme()
             self._busy = False
-            self._img_refs = []
-            self._tracked = []          # (widget, role) for manual re-theming
+            self._img_refs_gui = []
             self._current_archive = None
-            self._create_sources = []   # list of paths to add
+            self._last_output_dir = None
 
             self._set_icon()
-            self._build_layout()
-            self._apply_theme()
-            self._select_view("browse")
+            self._build_menu()
+            # Persistent status-bar action; hidden until an op produces output.
+            self._openfolder_btn = aura.AuraButton(
+                self.statusbar.actions, "Open output folder", kind="secondary",
+                height=30, command=self._open_last_folder)
+
+            self.add_section("browse", "Browse / Extract", "▤", self._build_browse)
+            self.add_section("create", "Create", "◈", self._build_create)
+            self.add_section("test", "Test", "✳", self._build_test)
+            self.show("browse")
             self._refresh_recent()
+            self.set_status("Ready")
             self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         # ---- assets / icon ------------------------------------------------
         def _set_icon(self):
             try:
                 ico = asset_path("archive-pro.ico")
-                if ico:
+                if ico and os.name == "nt":
                     self.iconbitmap(ico)
                     return
             except Exception:
@@ -177,210 +193,101 @@ def build_app():
                 png = asset_path("archive-pro.png")
                 if png:
                     img = tk.PhotoImage(file=png)
-                    self._img_refs.append(img)
+                    self._img_refs_gui.append(img)
                     self.iconphoto(True, img)
             except Exception:
                 pass  # icon is cosmetic; never block launch
 
-        def track(self, widget, role):
-            self._tracked.append((widget, role))
+        # ---- menu (native menus stay; theme lives in the sidebar toggle too)
+        def _build_menu(self):
+            bar = tk.Menu(self)
+            filem = tk.Menu(bar, tearoff=0)
+            filem.add_command(label="Open archive…",
+                              command=self._open_archive_from_menu)
+            filem.add_separator()
+            filem.add_command(label="Exit", command=self.destroy)
+            bar.add_cascade(label="File", menu=filem)
 
-        # ---- layout -------------------------------------------------------
-        def _build_layout(self):
-            self.columnconfigure(1, weight=1)
-            self.rowconfigure(0, weight=1)
+            viewm = tk.Menu(bar, tearoff=0)
+            viewm.add_command(
+                label="Toggle dark mode",
+                command=lambda: self.set_theme(
+                    "light" if self.theme == "dark" else "dark"))
+            bar.add_cascade(label="View", menu=viewm)
 
-            side = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 14))
-            side.grid(row=0, column=0, sticky="ns")
-            ttk.Label(side, text=APP_NAME, style="Brand.TLabel").pack(anchor="w")
-            ttk.Label(side, text="offline archiver", style="Status.TLabel").pack(
-                anchor="w", pady=(0, 14))
+            helpm = tk.Menu(bar, tearoff=0)
+            helpm.add_command(label="Open project page (quickopen.ai)",
+                              command=lambda: open_with_default_app(PROJECT_URL))
+            bar.add_cascade(label="Help", menu=helpm)
+            self.configure(menu=bar)
 
-            self._view_btns = {}
-            for vid, label in VIEWS:
-                b = ttk.Button(side, text=label, width=18,
-                               command=lambda v=vid: self._select_view(v))
-                b.pack(anchor="w", pady=3)
-                self._view_btns[vid] = b
+        def _open_archive_from_menu(self):
+            self.show("browse")
+            self._browse_open()
 
-            ttk.Frame(side, height=18, style="Sidebar.TFrame").pack()
-            self.theme_btn = ttk.Button(side, text="Toggle theme",
-                                        command=self._toggle_theme, width=18)
-            self.theme_btn.pack(anchor="w", pady=(6, 0), side="bottom")
+        @staticmethod
+        def _fill(entry, text):
+            entry.delete(0, "end")
+            if text:
+                entry.insert(0, text)
 
-            main = ttk.Frame(self, style="TFrame", padding=(16, 14))
-            main.grid(row=0, column=1, sticky="nsew")
-            main.columnconfigure(0, weight=1)
-            main.rowconfigure(1, weight=1)
+        # =================================================================
+        # Browse / Extract section
+        # =================================================================
+        def _build_browse(self, frame):
+            aura.Caption(
+                frame,
+                "Open an archive to inspect its contents, then extract "
+                "everything or just the selection.").pack(anchor="w",
+                                                          pady=(0, 12))
 
-            head = ttk.Frame(main, style="TFrame")
-            head.grid(row=0, column=0, sticky="ew")
-            self.title_lbl = ttk.Label(head, text="", style="Header.TLabel")
-            self.title_lbl.pack(anchor="w")
-            self.desc_lbl = ttk.Label(head, text="", style="Sub.TLabel")
-            self.desc_lbl.pack(anchor="w", pady=(2, 8))
-
-            self.body = ttk.Frame(main, style="TFrame")
-            self.body.grid(row=1, column=0, sticky="nsew")
-            self.body.columnconfigure(0, weight=1)
-            self.body.rowconfigure(0, weight=1)
-
-            # inline status / result bar
-            bar = ttk.Frame(main, style="Card.TFrame", padding=(10, 8))
-            bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-            bar.columnconfigure(0, weight=1)
-            self.result_lbl = ttk.Label(bar, text="Ready", style="Status.TLabel",
-                                        anchor="w", wraplength=760, justify="left")
-            self.result_lbl.grid(row=0, column=0, sticky="ew")
-            self.openfolder_btn = ttk.Button(bar, text="Open folder",
-                                             command=self._open_last_folder)
-            self._last_output_dir = None
-
-            self._panels = {}
-
-        # ---- theming ------------------------------------------------------
-        def _pal(self):
-            return PALETTES[self.theme]
-
-        def _toggle_theme(self):
-            self.theme = "light" if self.theme == "dark" else "dark"
-            guiconfig.set_theme(self.theme)
-            self._apply_theme()
-
-        def _apply_theme(self):
-            p = self._pal()
-            style = ttk.Style(self)
-            try:
-                style.theme_use("clam")
-            except Exception:
-                pass
-            self.configure(bg=p["bg"])
-            style.configure(".", background=p["bg"], foreground=p["text"],
-                            fieldbackground=p["entry"], bordercolor=p["border"],
-                            font=(FONT, 10))
-            style.configure("TFrame", background=p["bg"])
-            style.configure("Sidebar.TFrame", background=p["surface"])
-            style.configure("Card.TFrame", background=p["surface"])
-            style.configure("TLabel", background=p["bg"], foreground=p["text"])
-            style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Header.TLabel", background=p["bg"], foreground=p["text"],
-                            font=(FONT, 15, "bold"))
-            style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Brand.TLabel", background=p["surface"],
-                            foreground=p["text"], font=(FONT, 13, "bold"))
-            style.configure("Status.TLabel", background=p["surface"],
-                            foreground=p["muted"])
-            style.configure("TButton", background=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], focuscolor=p["surface"],
-                            padding=(10, 5))
-            style.map("TButton",
-                      background=[("active", p["trough"]), ("pressed", p["trough"])])
-            style.configure("Accent.TButton", background=p["primary"],
-                            foreground=p["sel_fg"])
-            style.map("Accent.TButton",
-                      background=[("active", p["primary_hi"]),
-                                  ("pressed", p["primary_hi"])])
-            style.configure("TEntry", fieldbackground=p["entry"],
-                            foreground=p["text"], bordercolor=p["border"])
-            style.configure("TCombobox", fieldbackground=p["entry"],
-                            foreground=p["text"])
-            style.configure("Treeview", background=p["surface"],
-                            fieldbackground=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"])
-            style.map("Treeview", background=[("selected", p["sel"])],
-                      foreground=[("selected", p["sel_fg"])])
-            style.configure("Treeview.Heading", background=p["trough"],
-                            foreground=p["text"])
-            # re-theme raw tk widgets
-            for w, role in self._tracked:
-                try:
-                    if role == "listbox":
-                        w.configure(bg=p["entry"], fg=p["text"],
-                                    selectbackground=p["sel"],
-                                    selectforeground=p["sel_fg"],
-                                    highlightbackground=p["border"])
-                except Exception:
-                    pass
-
-        # ---- view switching ----------------------------------------------
-        def _select_view(self, vid):
-            for k, b in self._view_btns.items():
-                b.state(["pressed"] if k == vid else ["!pressed"])
-            for child in self.body.winfo_children():
-                child.grid_forget()
-            panel = self._panels.get(vid)
-            if panel is None:
-                builder = getattr(self, f"_panel_{vid}")
-                panel = builder(self.body)
-                self._panels[vid] = panel
-                self._apply_theme()
-            panel.grid(row=0, column=0, sticky="nsew")
-            meta = {
-                "browse": ("Browse / Extract",
-                           "Open an archive to inspect its contents, then "
-                           "extract everything or just the selection."),
-                "create": ("Create archive",
-                           "Add files and folders, choose a format and options, "
-                           "then build. 7z supports a password (AES-256)."),
-                "test": ("Test integrity",
-                         "Verify that an archive (or split set) is complete and "
-                         "not corrupt."),
-            }[vid]
-            self.title_lbl.configure(text=meta[0])
-            self.desc_lbl.configure(text=meta[1])
-            self._clear_result()
-
-        # ---- Browse / Extract panel --------------------------------------
-        def _panel_browse(self, master):
-            f = ttk.Frame(master, style="TFrame")
-            f.columnconfigure(0, weight=1)
-            f.rowconfigure(2, weight=1)
-
-            top = ttk.Frame(f, style="TFrame")
-            top.grid(row=0, column=0, sticky="ew")
-            ttk.Button(top, text="Open archive…", style="Accent.TButton",
-                       command=self._browse_open).pack(side="left")
-            ttk.Label(top, text="Recent:", style="Sub.TLabel").pack(
-                side="left", padx=(12, 4))
+            top = ctk.CTkFrame(frame, fg_color="transparent")
+            top.pack(fill="x")
+            aura.AuraButton(top, "Open archive…", kind="primary",
+                            command=self._browse_open).pack(side="left")
+            aura.Caption(top, "Recent").pack(side="left", padx=(14, 6))
             self.recent_var = tk.StringVar()
-            self.recent_combo = ttk.Combobox(top, textvariable=self.recent_var,
-                                              state="readonly", width=48)
+            self.recent_combo = aura.AuraCombo(
+                top, variable=self.recent_var, values=[], state="readonly",
+                command=self._open_recent)
             self.recent_combo.pack(side="left", fill="x", expand=True)
-            self.recent_combo.bind("<<ComboboxSelected>>", self._open_recent)
 
-            pw = ttk.Frame(f, style="TFrame")
-            pw.grid(row=1, column=0, sticky="ew", pady=(8, 6))
-            ttk.Label(pw, text="Password (if needed):",
-                      style="Sub.TLabel").pack(side="left")
-            self.browse_pw = tk.StringVar()
-            ttk.Entry(pw, textvariable=self.browse_pw, show="•",
-                      width=24).pack(side="left", padx=(6, 0))
+            pw = ctk.CTkFrame(frame, fg_color="transparent")
+            pw.pack(fill="x", pady=(10, 8))
+            aura.Caption(pw, "Password (if needed)").pack(side="left",
+                                                          padx=(0, 8))
+            self.browse_pw = aura.AuraEntry(pw, placeholder="•••", show="•",
+                                            width=200)
+            self.browse_pw.pack(side="left")
 
+            body = ctk.CTkFrame(frame, fg_color="transparent")
+            body.pack(fill="both", expand=True)
             cols = ("size", "compressed")
-            tree = ttk.Treeview(f, columns=cols, show="tree headings",
+            tree = ttk.Treeview(body, columns=cols, show="tree headings",
                                 selectmode="extended")
-            tree.heading("#0", text="Name")
-            tree.heading("size", text="Size")
-            tree.heading("compressed", text="Compressed")
-            tree.column("#0", width=460)
+            tree.heading("#0", text=aura.spaced("Name"), anchor="w")
+            tree.heading("size", text=aura.spaced("Size"), anchor="e")
+            tree.heading("compressed", text=aura.spaced("Compressed"),
+                         anchor="e")
+            tree.column("#0", width=460, anchor="w")
             tree.column("size", width=110, anchor="e")
-            tree.column("compressed", width=110, anchor="e")
-            sb = ttk.Scrollbar(f, orient="vertical", command=tree.yview)
+            tree.column("compressed", width=120, anchor="e")
+            sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
             tree.configure(yscrollcommand=sb.set)
-            tree.grid(row=2, column=0, sticky="nsew")
-            sb.grid(row=2, column=1, sticky="ns")
+            sb.pack(side="right", fill="y")
+            tree.pack(side="left", fill="both", expand=True)
             self.browse_tree = tree
 
-            btns = ttk.Frame(f, style="TFrame")
-            btns.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-            ttk.Button(btns, text="Extract all…", style="Accent.TButton",
-                       command=lambda: self._do_extract(False)).pack(side="left")
-            ttk.Button(btns, text="Extract selected…",
-                       command=lambda: self._do_extract(True)).pack(
-                side="left", padx=6)
-            ttk.Button(btns, text="Test", command=self._do_test_current).pack(
+            btns = ctk.CTkFrame(frame, fg_color="transparent")
+            btns.pack(fill="x", pady=(12, 0))
+            aura.AuraButton(btns, "Extract all…", kind="primary",
+                            command=lambda: self._do_extract(False)).pack(
                 side="left")
-            return f
+            aura.AuraButton(btns, "Extract selected…", kind="secondary",
+                            command=lambda: self._do_extract(True)).pack(
+                side="left", padx=8)
+            aura.AuraButton(btns, "Test", kind="secondary",
+                            command=self._do_test_current).pack(side="left")
 
         def _browse_open(self):
             path = filedialog.askopenfilename(title="Open archive",
@@ -388,8 +295,9 @@ def build_app():
             if path:
                 self._load_archive(path)
 
-        def _open_recent(self, _evt=None):
-            path = self.recent_var.get()
+        def _open_recent(self, value=None):
+            path = value if isinstance(value, str) and value \
+                else self.recent_var.get()
             if path:
                 self._load_archive(path)
 
@@ -402,7 +310,7 @@ def build_app():
 
         def _load_archive(self, path):
             if not os.path.exists(path) and not _looks_split(path):
-                self._show_error(f"File not found: {path}")
+                self.set_error(f"File not found: {path}")
                 return
             pw = self.browse_pw.get() or None
             self._current_archive = path
@@ -433,13 +341,13 @@ def build_app():
 
         def _do_extract(self, selected_only):
             if not self._current_archive:
-                self._show_error("Open an archive first.")
+                self.set_error("Open an archive first.")
                 return
             members = None
             if selected_only:
                 members = list(self.browse_tree.selection())
                 if not members:
-                    self._show_error("Select one or more entries to extract.")
+                    self.set_error("Select one or more entries to extract.")
                     return
             dest = filedialog.askdirectory(title="Extract into folder")
             if not dest:
@@ -459,79 +367,87 @@ def build_app():
 
         def _do_test_current(self):
             if not self._current_archive:
-                self._show_error("Open an archive first.")
+                self.set_error("Open an archive first.")
                 return
             self._run_test(self._current_archive, self.browse_pw.get() or None)
 
-        # ---- Create panel -------------------------------------------------
-        def _panel_create(self, master):
-            f = ttk.Frame(master, style="TFrame")
-            f.columnconfigure(0, weight=1)
-            f.rowconfigure(1, weight=1)
+        # =================================================================
+        # Create section
+        # =================================================================
+        def _build_create(self, frame):
+            aura.Caption(
+                frame,
+                "Add files and folders, choose a format and options, then "
+                "build. 7z supports a password (AES-256).").pack(
+                anchor="w", pady=(0, 12))
 
-            add = ttk.Frame(f, style="TFrame")
-            add.grid(row=0, column=0, sticky="ew")
-            ttk.Button(add, text="Add files…", style="Accent.TButton",
-                       command=self._add_files).pack(side="left")
-            ttk.Button(add, text="Add folder…",
-                       command=self._add_folder).pack(side="left", padx=6)
-            ttk.Button(add, text="Remove", command=self._remove_source).pack(
-                side="left")
-            ttk.Button(add, text="Clear", command=self._clear_sources).pack(
-                side="left", padx=6)
-
-            lb_frame = ttk.Frame(f, style="TFrame")
-            lb_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
-            self.src_list = tk.Listbox(lb_frame, height=8, activestyle="none",
-                                       selectmode="extended", exportselection=False)
-            sb = ttk.Scrollbar(lb_frame, orient="vertical",
+            files = aura.Card(frame, title="Files & folders")
+            files.pack(fill="both", expand=True, pady=(0, 12))
+            addrow = ctk.CTkFrame(files.body, fg_color="transparent")
+            addrow.pack(fill="x", pady=(0, 8))
+            aura.AuraButton(addrow, "Add files…", kind="primary",
+                            command=self._add_files).pack(side="left")
+            aura.AuraButton(addrow, "Add folder…", kind="secondary",
+                            command=self._add_folder).pack(side="left", padx=8)
+            aura.AuraButton(addrow, "Remove", kind="secondary",
+                            command=self._remove_source).pack(side="left")
+            aura.AuraButton(addrow, "Clear", kind="ghost",
+                            command=self._clear_sources).pack(side="left",
+                                                              padx=8)
+            lbf = ctk.CTkFrame(files.body, fg_color="transparent")
+            lbf.pack(fill="both", expand=True)
+            self.src_list = tk.Listbox(lbf, height=6, activestyle="none",
+                                       selectmode="extended",
+                                       exportselection=False)
+            sb = ttk.Scrollbar(lbf, orient="vertical",
                                command=self.src_list.yview)
             self.src_list.configure(yscrollcommand=sb.set)
             sb.pack(side="right", fill="y")
             self.src_list.pack(side="left", fill="both", expand=True)
-            self.track(self.src_list, "listbox")
+            aura.track(self.src_list, "listbox")
 
-            opts = ttk.Frame(f, style="TFrame")
-            opts.grid(row=2, column=0, sticky="ew")
-            ttk.Label(opts, text="Format:", style="Sub.TLabel").grid(
-                row=0, column=0, sticky="w")
+            opts = aura.Card(frame, title="Options")
+            opts.pack(fill="x", pady=(0, 12))
+            og = ctk.CTkFrame(opts.body, fg_color="transparent")
+            og.pack(fill="x")
+            aura.Caption(og, "Format").grid(row=0, column=0, sticky="w",
+                                            padx=(0, 8), pady=(0, 8))
             self.fmt_var = tk.StringVar(value=CREATE_FORMATS[1][0])
-            self.fmt_combo = ttk.Combobox(
-                opts, textvariable=self.fmt_var, state="readonly", width=28,
+            self.fmt_combo = aura.AuraCombo(
+                og, variable=self.fmt_var, state="readonly", width=240,
                 values=[lbl for lbl, _ in CREATE_FORMATS])
-            self.fmt_combo.grid(row=0, column=1, sticky="w", padx=(6, 16))
+            self.fmt_combo.grid(row=0, column=1, sticky="w", padx=(0, 20),
+                                pady=(0, 8))
+            aura.Caption(og, "Level").grid(row=0, column=2, sticky="w",
+                                           padx=(0, 8), pady=(0, 8))
+            self.level_entry = aura.AuraEntry(og, placeholder="auto", width=90)
+            self.level_entry.grid(row=0, column=3, sticky="w", pady=(0, 8))
 
-            ttk.Label(opts, text="Level:", style="Sub.TLabel").grid(
-                row=0, column=2, sticky="w")
-            self.level_var = tk.StringVar()
-            ttk.Entry(opts, textvariable=self.level_var, width=6).grid(
-                row=0, column=3, sticky="w", padx=(6, 16))
+            aura.Caption(og, "Password (7z)").grid(row=1, column=0, sticky="w",
+                                                   padx=(0, 8))
+            self.create_pw = aura.AuraEntry(og, show="•", placeholder="optional",
+                                            width=240)
+            self.create_pw.grid(row=1, column=1, sticky="w", padx=(0, 20))
+            aura.Caption(og, "Split (e.g. 10M)").grid(row=1, column=2,
+                                                      sticky="w", padx=(0, 8))
+            self.split_entry = aura.AuraEntry(og, placeholder="e.g. 10M",
+                                              width=120)
+            self.split_entry.grid(row=1, column=3, sticky="w")
 
-            ttk.Label(opts, text="Password (7z):", style="Sub.TLabel").grid(
-                row=1, column=0, sticky="w", pady=(8, 0))
-            self.create_pw = tk.StringVar()
-            ttk.Entry(opts, textvariable=self.create_pw, show="•", width=24).grid(
-                row=1, column=1, sticky="w", padx=(6, 16), pady=(8, 0))
-
-            ttk.Label(opts, text="Split (e.g. 10M):", style="Sub.TLabel").grid(
-                row=1, column=2, sticky="w", pady=(8, 0))
-            self.split_var = tk.StringVar()
-            ttk.Entry(opts, textvariable=self.split_var, width=10).grid(
-                row=1, column=3, sticky="w", padx=(6, 16), pady=(8, 0))
-
-            out = ttk.Frame(f, style="TFrame")
-            out.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-            out.columnconfigure(1, weight=1)
-            ttk.Label(out, text="Save as:", style="Sub.TLabel").grid(
-                row=0, column=0, sticky="w")
-            self.out_var = tk.StringVar()
-            ttk.Entry(out, textvariable=self.out_var).grid(
-                row=0, column=1, sticky="ew", padx=6)
-            ttk.Button(out, text="Browse…", command=self._pick_output).grid(
-                row=0, column=2)
-            ttk.Button(out, text="Build archive", style="Accent.TButton",
-                       command=self._do_create).grid(row=0, column=3, padx=(8, 0))
-            return f
+            out = aura.Card(frame, title="Output")
+            out.pack(fill="x")
+            outg = ctk.CTkFrame(out.body, fg_color="transparent")
+            outg.pack(fill="x")
+            outg.grid_columnconfigure(1, weight=1)
+            aura.Caption(outg, "Save as").grid(row=0, column=0, sticky="w",
+                                               padx=(0, 8))
+            self.out_entry = aura.AuraEntry(outg, placeholder="Save archive as…")
+            self.out_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+            aura.AuraButton(outg, "Browse…", kind="secondary",
+                            command=self._pick_output).grid(row=0, column=2,
+                                                            padx=(0, 8))
+            aura.AuraButton(outg, "Build archive", kind="primary",
+                            command=self._do_create).grid(row=0, column=3)
 
         def _add_files(self):
             paths = filedialog.askopenfilenames(title="Add files")
@@ -564,22 +480,22 @@ def build_app():
                                              defaultextension=ext,
                                              initialfile="archive" + ext)
             if p:
-                self.out_var.set(p)
+                self._fill(self.out_entry, p)
 
         def _do_create(self):
             sources = list(self.src_list.get(0, "end"))
             if not sources:
-                self._show_error("Add at least one file or folder.")
+                self.set_error("Add at least one file or folder.")
                 return
-            out = self.out_var.get().strip()
+            out = self.out_entry.get().strip()
             if not out:
-                self._show_error("Choose an output path (Save as).")
+                self.set_error("Choose an output path (Save as).")
                 return
             fmt = self._current_fmt()
-            level = self.level_var.get().strip()
+            level = self.level_entry.get().strip()
             level = int(level) if level.isdigit() else None
             pw = self.create_pw.get() or None
-            split = self.split_var.get().strip() or None
+            split = self.split_entry.get().strip() or None
             from .__main__ import _parse_size
 
             def work():
@@ -598,37 +514,47 @@ def build_app():
 
             self._bg(work, ok, busy="Building archive…")
 
-        # ---- Test panel ---------------------------------------------------
-        def _panel_test(self, master):
-            f = ttk.Frame(master, style="TFrame")
-            f.columnconfigure(1, weight=1)
-            ttk.Label(f, text="Archive:", style="Sub.TLabel").grid(
-                row=0, column=0, sticky="w")
-            self.test_path = tk.StringVar()
-            ttk.Entry(f, textvariable=self.test_path).grid(
-                row=0, column=1, sticky="ew", padx=6)
-            ttk.Button(f, text="Browse…", command=self._pick_test).grid(
-                row=0, column=2)
-            ttk.Label(f, text="Password:", style="Sub.TLabel").grid(
-                row=1, column=0, sticky="w", pady=(8, 0))
-            self.test_pw = tk.StringVar()
-            ttk.Entry(f, textvariable=self.test_pw, show="•", width=24).grid(
-                row=1, column=1, sticky="w", padx=6, pady=(8, 0))
-            ttk.Button(f, text="Run integrity test", style="Accent.TButton",
-                       command=self._do_test_panel).grid(
-                row=2, column=1, sticky="w", pady=(12, 0))
-            return f
+        # =================================================================
+        # Test section
+        # =================================================================
+        def _build_test(self, frame):
+            aura.Caption(
+                frame,
+                "Verify that an archive (or split set) is complete and not "
+                "corrupt.").pack(anchor="w", pady=(0, 12))
+
+            card = aura.Card(frame, title="Test integrity")
+            card.pack(fill="x")
+            g = ctk.CTkFrame(card.body, fg_color="transparent")
+            g.pack(fill="x")
+            g.grid_columnconfigure(1, weight=1)
+            aura.Caption(g, "Archive").grid(row=0, column=0, sticky="w",
+                                            padx=(0, 8), pady=(0, 8))
+            self.test_path = aura.AuraEntry(g, placeholder="Archive to test…")
+            self.test_path.grid(row=0, column=1, sticky="ew", padx=(0, 8),
+                                pady=(0, 8))
+            aura.AuraButton(g, "Browse…", kind="secondary",
+                            command=self._pick_test).grid(row=0, column=2,
+                                                          pady=(0, 8))
+            aura.Caption(g, "Password").grid(row=1, column=0, sticky="w",
+                                             padx=(0, 8))
+            self.test_pw = aura.AuraEntry(g, show="•", placeholder="optional",
+                                          width=220)
+            self.test_pw.grid(row=1, column=1, sticky="w")
+            aura.AuraButton(card.body, "Run integrity test", kind="primary",
+                            command=self._do_test_panel).pack(anchor="w",
+                                                              pady=(14, 0))
 
         def _pick_test(self):
             p = filedialog.askopenfilename(title="Choose archive",
                                            filetypes=ARCHIVE_TYPES)
             if p:
-                self.test_path.set(p)
+                self._fill(self.test_path, p)
 
         def _do_test_panel(self):
             path = self.test_path.get().strip()
             if not path:
-                self._show_error("Choose an archive to test.")
+                self.set_error("Choose an archive to test.")
                 return
             self._run_test(path, self.test_pw.get() or None)
 
@@ -641,23 +567,27 @@ def build_app():
                     self.report_success(f"OK — {os.path.basename(path)} passed "
                                         f"the integrity check.")
                 else:
-                    self._show_error(f"{os.path.basename(path)} is corrupt or "
-                                     f"incomplete.")
+                    self.set_error(f"{os.path.basename(path)} is corrupt or "
+                                   f"incomplete.")
 
             self._bg(work, ok, busy="Testing…")
 
-        # ---- background op runner ----------------------------------------
+        # =================================================================
+        # Background op runner + status helpers
+        # =================================================================
         def _bg(self, work, on_ok, busy="Working…"):
             """Run ``work()`` off the UI thread; call ``on_ok(result)`` back on it.
 
-            Errors are shown inline (ArchiveError message, or a generic note),
-            never as a traceback.  Refuses to start a second op while one runs.
+            Errors are shown inline in the Aura status bar (ArchiveError
+            message, or a generic note), never as a traceback.  Refuses to
+            start a second op while one runs.
             """
             if self._busy:
-                self._show_error("Please wait — an operation is already running.")
+                self.set_error("Please wait — an operation is already running.")
                 return
             self._busy = True
-            self._set_status(busy, kind="working")
+            self._openfolder_btn.pack_forget()
+            self.set_status(busy, kind="working")
 
             def run():
                 try:
@@ -671,31 +601,14 @@ def build_app():
             def finish(res, err):
                 self._busy = False
                 if err is not None:
-                    self._show_error(err)
+                    self.set_error(err)
                     return
                 try:
                     on_ok(res)
                 except Exception as ex:
-                    self._show_error(f"Post-processing error: {ex}")
+                    self.set_error(f"Post-processing error: {ex}")
 
             threading.Thread(target=run, daemon=True).start()
-
-        # ---- result bar helpers ------------------------------------------
-        def _set_status(self, text, kind="idle"):
-            p = self._pal()
-            color = {"working": p["primary"], "ok": p["ok"], "err": p["err"]}.get(
-                kind, p["muted"])
-            self.result_lbl.configure(text=text, foreground=color)
-            self.openfolder_btn.grid_forget()
-
-        def _clear_result(self):
-            self.result_lbl.configure(text="Ready", foreground=self._pal()["muted"])
-            self.openfolder_btn.grid_forget()
-
-        def _show_error(self, message):
-            self.result_lbl.configure(text="✕ " + message,
-                                      foreground=self._pal()["err"])
-            self.openfolder_btn.grid_forget()
 
         def report_success(self, message, outputs=None):
             outputs = outputs or []
@@ -710,9 +623,8 @@ def build_app():
                 self._last_output_dir = (
                     first if os.path.isdir(first)
                     else os.path.dirname(os.path.abspath(first)))
-                self.openfolder_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
-            self.result_lbl.configure(text="✓ " + message,
-                                      foreground=self._pal()["ok"])
+                self._openfolder_btn.pack(side="left")
+            self.set_success(message)
 
         def _open_last_folder(self):
             if self._last_output_dir:
@@ -732,8 +644,8 @@ def main():
     """Entry point: build the root window and run.  Degrades on headless hosts.
 
     Importing this module does nothing; only this function creates a Tk root.
-    With no display (e.g. a server), it prints a friendly note and returns 0
-    instead of raising.
+    With no display (e.g. a server) or without customtkinter installed, it
+    prints a friendly note and returns 0 instead of raising.
     """
     if os.name != "nt" and not os.environ.get("DISPLAY") and sys.platform != "darwin":
         print(f"{APP_NAME}: no graphical display available — this GUI is meant "
@@ -750,6 +662,10 @@ def main():
     try:
         App = build_app()
         app = App()
+    except ImportError as exc:
+        print(f"{APP_NAME}: the GUI needs the 'customtkinter' package "
+              f"({exc}). Install it with:  pip install customtkinter")
+        return 0
     except tk.TclError as exc:
         print(f"{APP_NAME}: no graphical display available — cannot start the "
               f"GUI here ({exc}). This app is intended for the desktop.")

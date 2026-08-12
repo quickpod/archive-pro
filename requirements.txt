@@ -1,3 +1,6 @@
 # ArchivePro runtime deps — permissive/weak-copyleft only, no AGPL/proprietary.
 py7zr>=0.21
 zstandard>=0.22
+# Aura design system (CustomTkinter, MIT) + its dark/light detector.
+customtkinter>=5.2
+darkdetect>=0.8
