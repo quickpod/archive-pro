@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-r"""ArchivePro -- an Aura (QuickOpen design system) GUI on top of the ``archivepro`` API.
+r"""ArchivePro -- an Aura (QuickOpen design system) GUI on top of the
+``archivepro`` API.
 
-A single Aura window with a sidebar of three sections: **Browse / Extract**
-(open an archive, inspect its contents in a table, extract all or the
-selection), **Create** (add files/folders, pick a format + options, build,
-optionally encrypted 7z or split into volumes) and **Test** (verify an archive
-or split set).  Every operation calls the tested core library (never
-re-implements archive logic) and runs on a background thread so the UI stays
-responsive; results are marshalled back with ``self.after`` and reported in the
-Aura status bar -- a summary line on success, or the ``ArchiveError`` message
-(never a raw traceback) on failure.
+Layout per branding/aura-design-system/APP-LAYOUT-LANGUAGE.md, benchmarked
+against 7-Zip's file-manager window (minus its pro tail):
 
-Design goals baked in here (mirrors the QuickOpen house style):
-  * built on the vendored ``archivepro/aura.py`` design system, which layers the
-    quickopen.ai look (deep space + light) over CustomTkinter.  Runtime deps:
-    ``customtkinter`` (+ ``darkdetect``) -- declared in requirements.txt; the
-    PyInstaller build adds ``--collect-all customtkinter``.
-  * Importing this module does nothing.  Only :func:`main` builds a root
-    window, and it degrades gracefully (prints a message, returns 0) with no
-    display or with customtkinter missing.
-  * Frozen-exe safe: bundled assets are resolved via ``sys._MEIPASS`` / the exe
-    directory when ``sys.frozen`` is set -- never ``__file__``.
+  * **Sidebar** (AuraApp) -- Archive / Create / About nav plus a "Recent
+    archives" library in ``sidebar_body`` (click to reopen).  Collapsible
+    with Ctrl+\.
+  * **Archive section** -- a 7-Zip-style toolbar (Open archive, Extract all,
+    Extract selected, Test), a password field and a filter box on the right,
+    over the contents table (Name / Size / Compressed / Modified).
+    Right-click rows for Extract selected.  An Aura illustration fills the
+    empty state before any archive is open.
+  * **Create section** -- add files/folders, pick a format + options
+    (7z AES-256 password, split volumes), build.  The output name is
+    suggested from the first source.
+  * **Status bar** -- entry counts + sizes; errors surface here, and an
+    "Open output folder" action appears after successful operations.
+
+A Ctrl+, Settings dialog offers the System/Light/Dark theme; fresh installs
+follow the OS Aura theme live.  Every operation calls the tested core library
+and runs on a background thread; failures show the ``ArchiveError`` message,
+never a traceback.
 
 100% AI-built, open source, published on QuickOpen (quickopen.ai).
 """
@@ -30,16 +32,18 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 
 # NOTE: tkinter/customtkinter/aura are imported lazily inside build_app()/main()
 # so that merely importing this module (e.g. during packaging or on a headless
 # CI box, or without customtkinter installed) never fails.
 
 APP_NAME = "ArchivePro"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 WINDOW_TITLE = "ArchivePro — by QuickOpen (quickopen.ai)"
 PROJECT_URL = "https://quickopen.ai"
-ACCENT = "#b0700a"      # publish/specs/archive-pro.json "accent": [176, 112, 10]
+ACCENT = "#5b86f7"      # Aura brand accent (the old per-app orange was a
+                        # legacy scaffold accent)
 
 ARCHIVE_TYPES = [
     ("Archives", "*.zip *.7z *.tar *.tar.gz *.tgz *.tar.bz2 *.tar.xz *.zst *.gz"),
@@ -95,6 +99,26 @@ def human_size(num_bytes):
     return f"{size:.1f} TB"
 
 
+def rel_date(ts, now=None):
+    """A compact human stamp: 'now', '5m', '2h', 'Yesterday', '12 Aug'."""
+    if not ts:
+        return ""
+    now = now if now is not None else time.time()
+    diff = max(0, now - ts)
+    if diff < 90:
+        return "now"
+    if diff < 3600:
+        return "%dm" % (diff // 60)
+    if diff < 86400 and time.localtime(ts).tm_mday == time.localtime(now).tm_mday:
+        return "%dh" % (diff // 3600)
+    if diff < 2 * 86400:
+        return "Yesterday"
+    st, sn = time.localtime(ts), time.localtime(now)
+    if st.tm_year == sn.tm_year:
+        return time.strftime("%d %b", st)
+    return time.strftime("%b %Y", st)
+
+
 def open_in_file_manager(path):
     """Best-effort 'reveal in file manager', guarded on every platform."""
     try:
@@ -139,7 +163,7 @@ def build_app():
     """
     import tkinter as tk
     from tkinter import ttk, filedialog
-    import customtkinter as ctk  # noqa: F401 - imported so ImportError surfaces here
+    import customtkinter as ctk
 
     from . import aura, guiconfig
     # archivepro/__init__ rebinds the package attributes 'create'/'extract'/
@@ -150,6 +174,8 @@ def build_app():
     from .extract import extract
     from .inspect import list_contents, test_archive
 
+    pair = aura._pair
+
     class App(aura.AuraApp):
         def __init__(self):
             super().__init__(
@@ -158,11 +184,13 @@ def build_app():
                 icon_png=asset_path("archive-pro.png"), version=APP_VERSION,
                 tagline="offline archiver",
                 on_theme_change=guiconfig.set_theme,
-                size=(1040, 720), min_size=(880, 600))
+                size=(1180, 720), min_size=(960, 600))
 
             self._busy = False
             self._img_refs_gui = []
             self._current_archive = None
+            self._entries = []
+            self._password = None       # for encrypted archives (Password…)
             self._last_output_dir = None
 
             self._set_icon()
@@ -172,11 +200,11 @@ def build_app():
                 self.statusbar.actions, "Open output folder", kind="secondary",
                 height=30, command=self._open_last_folder)
 
-            self.add_section("browse", "Browse / Extract", "▤", self._build_browse)
+            self.add_section("archive", "Archive", "▤", self._build_archive)
             self.add_section("create", "Create", "◈", self._build_create)
-            self.add_section("test", "Test", "✳", self._build_test)
-            self.show("browse")
-            self._refresh_recent()
+            self.add_section("about", "About", "ℹ", self._build_about)
+            self._build_recent_sidebar()
+            self.show("archive")
             self.set_status("Ready")
             self.protocol("WM_DELETE_WINDOW", self.destroy)
 
@@ -198,17 +226,24 @@ def build_app():
             except Exception:
                 pass  # icon is cosmetic; never block launch
 
-        # ---- menu (native menus stay; theme lives in the sidebar toggle too)
+        # ---- menu + keyboard baseline (APP-LAYOUT-LANGUAGE.md §7/§9) ------
         def _build_menu(self):
             bar = tk.Menu(self)
             filem = tk.Menu(bar, tearoff=0)
-            filem.add_command(label="Open archive…",
+            filem.add_command(label="Open archive…", accelerator="Ctrl+O",
                               command=self._open_archive_from_menu)
+            filem.add_command(label="New archive", accelerator="Ctrl+N",
+                              command=lambda: self.show("create"))
+            filem.add_separator()
+            filem.add_command(label="Settings…", accelerator="Ctrl+,",
+                              command=self._open_settings)
             filem.add_separator()
             filem.add_command(label="Exit", command=self.destroy)
             bar.add_cascade(label="File", menu=filem)
 
             viewm = tk.Menu(bar, tearoff=0)
+            viewm.add_command(label="Toggle sidebar", accelerator="Ctrl+\\",
+                              command=self.toggle_sidebar)
             viewm.add_command(
                 label="Toggle dark mode",
                 command=lambda: self.set_theme(
@@ -216,14 +251,54 @@ def build_app():
             bar.add_cascade(label="View", menu=viewm)
 
             helpm = tk.Menu(bar, tearoff=0)
+            helpm.add_command(label="About", command=lambda: self.show("about"))
             helpm.add_command(label="Open project page (quickopen.ai)",
                               command=lambda: open_with_default_app(PROJECT_URL))
             bar.add_cascade(label="Help", menu=helpm)
             self.configure(menu=bar)
 
+            self.bind_all("<Control-o>",
+                          lambda e: (self._open_archive_from_menu(), "break")[1])
+            self.bind_all("<Control-n>",
+                          lambda e: (self.show("create"), "break")[1])
+            self.bind_all("<Control-f>",
+                          lambda e: (self._focus_filter(), "break")[1])
+            self.bind_all("<Control-comma>",
+                          lambda e: (self._open_settings(), "break")[1])
+
         def _open_archive_from_menu(self):
-            self.show("browse")
+            self.show("archive")
             self._browse_open()
+
+        def _focus_filter(self):
+            try:
+                self.show("archive")
+                self.filter_entry.focus_set()
+            except Exception:
+                pass
+
+        def _password_dialog(self):
+            """Set (or clear) the password used for encrypted archives."""
+            dlg = aura.Dialog(self, title="Archive password", size=(420, 210))
+            aura.Caption(dlg.body,
+                         "Used when opening, extracting or testing an "
+                         "encrypted archive. Leave blank for none.").pack(
+                anchor="w")
+            entry = aura.AuraEntry(dlg.body, placeholder="password", show="•")
+            entry.pack(fill="x", pady=(8, 0))
+            if self._password:
+                entry.insert(0, self._password)
+
+            def ok(_e=None):
+                self._password = entry.get() or None
+                dlg.close()
+                self.set_status("Password set." if self._password
+                                else "Password cleared.")
+
+            dlg.add_button("OK", ok)
+            dlg.add_button("Cancel", dlg.close, kind="secondary")
+            entry.bind("<Return>", ok)
+            self.after(120, entry.focus_set)
 
         @staticmethod
         def _fill(entry, text):
@@ -232,62 +307,130 @@ def build_app():
                 entry.insert(0, text)
 
         # =================================================================
-        # Browse / Extract section
+        # Sidebar library: recent archives
         # =================================================================
-        def _build_browse(self, frame):
-            aura.Caption(
-                frame,
-                "Open an archive to inspect its contents, then extract "
-                "everything or just the selection.").pack(anchor="w",
-                                                          pady=(0, 12))
+        def _build_recent_sidebar(self):
+            aura.SectionLabel(self.sidebar_body, "Recent archives").pack(
+                anchor="w", padx=6, pady=(0, 4))
+            self._recent_scroll = ctk.CTkScrollableFrame(
+                self.sidebar_body, fg_color="transparent")
+            self._recent_scroll.pack(fill="both", expand=True)
+            self._refresh_recent()
 
-            top = ctk.CTkFrame(frame, fg_color="transparent")
-            top.pack(fill="x")
-            aura.AuraButton(top, "Open archive…", kind="primary",
-                            command=self._browse_open).pack(side="left")
-            aura.Caption(top, "Recent").pack(side="left", padx=(14, 6))
-            self.recent_var = tk.StringVar()
-            self.recent_combo = aura.AuraCombo(
-                top, variable=self.recent_var, values=[], state="readonly",
-                command=self._open_recent)
-            self.recent_combo.pack(side="left", fill="x", expand=True)
+        def _refresh_recent(self):
+            for w in list(self._recent_scroll.winfo_children()):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+            recent = [p for p in guiconfig.get_recent()]
+            if not recent:
+                aura.Caption(self._recent_scroll,
+                             "Archives you open appear here.").pack(
+                    anchor="w", padx=6, pady=2)
+                return
+            for p in recent[:12]:
+                active = (p == self._current_archive)
+                btn = ctk.CTkButton(
+                    self._recent_scroll, text=os.path.basename(p) or p,
+                    anchor="w", height=30,
+                    corner_radius=aura.TOKENS["geometry"]["radius_button"],
+                    fg_color=pair("accent_soft") if active else "transparent",
+                    hover_color=(aura._pal["light"]["surface2"],
+                                 aura._pal["dark"]["surface2"]),
+                    text_color=pair("text") if active else pair("muted"),
+                    font=aura.font(role="body"),
+                    command=lambda pp=p: self._load_archive(pp))
+                btn.pack(fill="x", pady=1)
+                aura.Tooltip(btn, p)
 
-            pw = ctk.CTkFrame(frame, fg_color="transparent")
-            pw.pack(fill="x", pady=(10, 8))
-            aura.Caption(pw, "Password (if needed)").pack(side="left",
-                                                          padx=(0, 8))
-            self.browse_pw = aura.AuraEntry(pw, placeholder="•••", show="•",
-                                            width=200)
-            self.browse_pw.pack(side="left")
+        # =================================================================
+        # Archive section — toolbar + contents table (7-Zip layout)
+        # =================================================================
+        def _build_archive(self, frame):
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(1, weight=1)
 
-            body = ctk.CTkFrame(frame, fg_color="transparent")
-            body.pack(fill="both", expand=True)
-            cols = ("size", "compressed")
-            tree = ttk.Treeview(body, columns=cols, show="tree headings",
+            tb = aura.Toolbar(frame)
+            tb.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            tb.add_button("Open archive…", self._browse_open, kind="primary")
+            tb.add_button("⤓ Extract all", lambda: self._do_extract(False))
+            tb.add_button("Extract selected",
+                          lambda: self._do_extract(True), kind="ghost")
+            tb.add_separator()
+            tb.add_button("✓ Test", self._do_test_current, kind="ghost")
+            tb.add_button("Password…", self._password_dialog, kind="ghost",
+                          tooltip="Password for encrypted archives")
+            self.filter_entry = tb.add_search(
+                "Filter entries…  (Ctrl+F)",
+                on_change=lambda _t: self._populate_tree(), width=170)
+
+            wrap = ctk.CTkFrame(frame, fg_color=pair("surface"),
+                                corner_radius=10, border_width=1,
+                                border_color=pair("border"))
+            wrap.grid(row=1, column=0, sticky="nsew")
+            cols = ("size", "compressed", "modified")
+            tree = ttk.Treeview(wrap, columns=cols, show="tree headings",
                                 selectmode="extended")
-            tree.heading("#0", text=aura.spaced("Name"), anchor="w")
-            tree.heading("size", text=aura.spaced("Size"), anchor="e")
-            tree.heading("compressed", text=aura.spaced("Compressed"),
-                         anchor="e")
-            tree.column("#0", width=460, anchor="w")
-            tree.column("size", width=110, anchor="e")
-            tree.column("compressed", width=120, anchor="e")
-            sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+            tree.heading("#0", text="Name", anchor="w")
+            tree.heading("size", text="Size", anchor="e")
+            tree.heading("compressed", text="Compressed", anchor="e")
+            tree.heading("modified", text="Modified", anchor="e")
+            tree.column("#0", width=430, anchor="w")
+            tree.column("size", width=100, minwidth=80, anchor="e",
+                        stretch=False)
+            tree.column("compressed", width=110, minwidth=90, anchor="e",
+                        stretch=False)
+            tree.column("modified", width=100, minwidth=80, anchor="e",
+                        stretch=False)
+            sb = aura.AuraScrollbar(wrap, command=tree.yview)
             tree.configure(yscrollcommand=sb.set)
-            sb.pack(side="right", fill="y")
-            tree.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y", padx=(0, 4), pady=6)
+            tree.pack(side="left", fill="both", expand=True, padx=(6, 0),
+                      pady=6)
+            tree.bind("<Button-3>", self._show_entry_menu)
             self.browse_tree = tree
+            self._entry_menu = tk.Menu(self, tearoff=0)
+            aura.track(self._entry_menu, "menu")
 
-            btns = ctk.CTkFrame(frame, fg_color="transparent")
-            btns.pack(fill="x", pady=(12, 0))
-            aura.AuraButton(btns, "Extract all…", kind="primary",
-                            command=lambda: self._do_extract(False)).pack(
-                side="left")
-            aura.AuraButton(btns, "Extract selected…", kind="secondary",
-                            command=lambda: self._do_extract(True)).pack(
-                side="left", padx=8)
-            aura.AuraButton(btns, "Test", kind="secondary",
-                            command=self._do_test_current).pack(side="left")
+            self.empty_archive = aura.EmptyState(
+                frame, title="No archive open",
+                caption="Open a ZIP, 7z, TAR (gz/bz2/xz), Zstandard or Gzip "
+                        "file to inspect and extract it — or press Ctrl+N to "
+                        "create a new archive.",
+                action_text="Open archive…", action=self._browse_open,
+                image=(asset_path("assets/archive-empty-light.png"),
+                       asset_path("assets/archive-empty-dark.png")))
+            self._update_empty_state()
+
+        def _update_empty_state(self):
+            if self._current_archive is None:
+                self.empty_archive.place(relx=0, rely=0.06, relwidth=1,
+                                         relheight=0.94)
+                self.empty_archive.lift()
+            else:
+                self.empty_archive.place_forget()
+
+        def _show_entry_menu(self, event):
+            iid = self.browse_tree.identify_row(event.y)
+            if not iid:
+                return
+            if iid not in self.browse_tree.selection():
+                self.browse_tree.selection_set(iid)
+            m = self._entry_menu
+            m.delete(0, "end")
+            m.add_command(label="Extract selected…",
+                          command=lambda: self._do_extract(True))
+            m.add_command(label="Extract all…",
+                          command=lambda: self._do_extract(False))
+            aura.style_menu(m)
+            try:
+                m.tk_popup(event.x_root, event.y_root)
+            finally:
+                try:
+                    m.grab_release()
+                except Exception:
+                    pass
 
         def _browse_open(self):
             path = filedialog.askopenfilename(title="Open archive",
@@ -295,49 +438,63 @@ def build_app():
             if path:
                 self._load_archive(path)
 
-        def _open_recent(self, value=None):
-            path = value if isinstance(value, str) and value \
-                else self.recent_var.get()
-            if path:
-                self._load_archive(path)
-
-        def _refresh_recent(self):
-            try:
-                recent = guiconfig.get_recent()
-                self.recent_combo.configure(values=recent)
-            except Exception:
-                pass
-
         def _load_archive(self, path):
             if not os.path.exists(path) and not _looks_split(path):
                 self.set_error(f"File not found: {path}")
                 return
-            pw = self.browse_pw.get() or None
-            self._current_archive = path
+            self.show("archive")
+            pw = self._password
 
             def work():
                 return list_contents(path, password=pw)
 
             def ok(entries):
-                self._populate_tree(entries)
+                self._current_archive = path
+                self._entries = entries
+                try:
+                    self.filter_entry.set("")
+                except Exception:
+                    pass
+                self._populate_tree()
                 guiconfig.add_recent(path)
                 self._refresh_recent()
-                self.report_success(
-                    f"Opened {os.path.basename(path)} — {len(entries)} entr"
-                    f"{'y' if len(entries) == 1 else 'ies'}.")
+                self._update_empty_state()
+                total = sum(e["size"] or 0 for e in entries)
+                self.set_success(
+                    f"{os.path.basename(path)} — {len(entries)} entr"
+                    f"{'y' if len(entries) == 1 else 'ies'}, "
+                    f"{human_size(total)} uncompressed.")
 
             self._bg(work, ok, busy="Reading archive…")
 
-        def _populate_tree(self, entries):
+        def _populate_tree(self):
             tree = self.browse_tree
             tree.delete(*tree.get_children())
-            for e in entries:
+            q = ""
+            try:
+                q = self.filter_entry.get().strip().lower()
+            except Exception:
+                pass
+            now = time.time()
+            shown = 0
+            for e in self._entries:
                 name = e["name"]
+                if q and q not in name.lower():
+                    continue
                 size = human_size(e["size"])
                 comp = "-" if e["compressed"] is None else human_size(e["compressed"])
+                mod = rel_date(e.get("modified"), now)
                 tree.insert("", "end", iid=name,
                             text=name + ("/" if e["is_dir"] else ""),
-                            values=(size, comp))
+                            values=(size, comp, mod))
+                shown += 1
+            if self._current_archive is not None:
+                total = len(self._entries)
+                if q:
+                    self.set_status(f"{shown} of {total} entries match.")
+                else:
+                    self.set_status(f"{total} entr"
+                                    f"{'y' if total == 1 else 'ies'}.")
 
         def _do_extract(self, selected_only):
             if not self._current_archive:
@@ -352,7 +509,7 @@ def build_app():
             dest = filedialog.askdirectory(title="Extract into folder")
             if not dest:
                 return
-            pw = self.browse_pw.get() or None
+            pw = self._password
             archive = self._current_archive
 
             def work():
@@ -369,7 +526,7 @@ def build_app():
             if not self._current_archive:
                 self.set_error("Open an archive first.")
                 return
-            self._run_test(self._current_archive, self.browse_pw.get() or None)
+            self._run_test(self._current_archive, self._password)
 
         # =================================================================
         # Create section
@@ -385,7 +542,7 @@ def build_app():
             files.pack(fill="both", expand=True, pady=(0, 12))
             addrow = ctk.CTkFrame(files.body, fg_color="transparent")
             addrow.pack(fill="x", pady=(0, 8))
-            aura.AuraButton(addrow, "Add files…", kind="primary",
+            aura.AuraButton(addrow, "＋ Add files…", kind="primary",
                             command=self._add_files).pack(side="left")
             aura.AuraButton(addrow, "Add folder…", kind="secondary",
                             command=self._add_folder).pack(side="left", padx=8)
@@ -399,8 +556,7 @@ def build_app():
             self.src_list = tk.Listbox(lbf, height=6, activestyle="none",
                                        selectmode="extended",
                                        exportselection=False)
-            sb = ttk.Scrollbar(lbf, orient="vertical",
-                               command=self.src_list.yview)
+            sb = aura.AuraScrollbar(lbf, command=self.src_list.yview)
             self.src_list.configure(yscrollcommand=sb.set)
             sb.pack(side="right", fill="y")
             self.src_list.pack(side="left", fill="both", expand=True)
@@ -449,15 +605,32 @@ def build_app():
             aura.AuraButton(outg, "Build archive", kind="primary",
                             command=self._do_create).grid(row=0, column=3)
 
+        def _suggest_output(self):
+            """Prefill 'Save as' from the first source (7-Zip's 'Add' flow)."""
+            if self.out_entry.get().strip():
+                return
+            items = self.src_list.get(0, "end")
+            if not items:
+                return
+            first = items[0]
+            base = os.path.basename(first.rstrip("/\\")) or "archive"
+            root, _ = os.path.splitext(base)
+            fmt = self._current_fmt() or "zip"
+            self._fill(self.out_entry, os.path.join(
+                os.path.dirname(first), (root or "archive") + "." + fmt))
+
         def _add_files(self):
             paths = filedialog.askopenfilenames(title="Add files")
             for p in paths:
                 self.src_list.insert("end", p)
+            if paths:
+                self._suggest_output()
 
         def _add_folder(self):
             p = filedialog.askdirectory(title="Add folder")
             if p:
                 self.src_list.insert("end", p)
+                self._suggest_output()
 
         def _remove_source(self):
             for i in reversed(self.src_list.curselection()):
@@ -514,50 +687,6 @@ def build_app():
 
             self._bg(work, ok, busy="Building archive…")
 
-        # =================================================================
-        # Test section
-        # =================================================================
-        def _build_test(self, frame):
-            aura.Caption(
-                frame,
-                "Verify that an archive (or split set) is complete and not "
-                "corrupt.").pack(anchor="w", pady=(0, 12))
-
-            card = aura.Card(frame, title="Test integrity")
-            card.pack(fill="x")
-            g = ctk.CTkFrame(card.body, fg_color="transparent")
-            g.pack(fill="x")
-            g.grid_columnconfigure(1, weight=1)
-            aura.Caption(g, "Archive").grid(row=0, column=0, sticky="w",
-                                            padx=(0, 8), pady=(0, 8))
-            self.test_path = aura.AuraEntry(g, placeholder="Archive to test…")
-            self.test_path.grid(row=0, column=1, sticky="ew", padx=(0, 8),
-                                pady=(0, 8))
-            aura.AuraButton(g, "Browse…", kind="secondary",
-                            command=self._pick_test).grid(row=0, column=2,
-                                                          pady=(0, 8))
-            aura.Caption(g, "Password").grid(row=1, column=0, sticky="w",
-                                             padx=(0, 8))
-            self.test_pw = aura.AuraEntry(g, show="•", placeholder="optional",
-                                          width=220)
-            self.test_pw.grid(row=1, column=1, sticky="w")
-            aura.AuraButton(card.body, "Run integrity test", kind="primary",
-                            command=self._do_test_panel).pack(anchor="w",
-                                                              pady=(14, 0))
-
-        def _pick_test(self):
-            p = filedialog.askopenfilename(title="Choose archive",
-                                           filetypes=ARCHIVE_TYPES)
-            if p:
-                self._fill(self.test_path, p)
-
-        def _do_test_panel(self):
-            path = self.test_path.get().strip()
-            if not path:
-                self.set_error("Choose an archive to test.")
-                return
-            self._run_test(path, self.test_pw.get() or None)
-
         def _run_test(self, path, pw):
             def work():
                 return test_archive(path, password=pw)
@@ -571,6 +700,87 @@ def build_app():
                                    f"incomplete.")
 
             self._bg(work, ok, busy="Testing…")
+
+        # ---- settings (Ctrl+,) --------------------------------------------
+        def _open_settings(self):
+            dlg = aura.Dialog(self, title="Settings", size=(520, 340))
+
+            aura.SectionLabel(dlg.body, "Appearance").pack(anchor="w",
+                                                           pady=(0, 2))
+            trow = ctk.CTkFrame(dlg.body, fg_color="transparent")
+            trow.pack(anchor="w", pady=(4, 2))
+            aura.Caption(trow, "Theme").pack(side="left", padx=(0, 10))
+            cur = guiconfig.get_theme()
+            th = aura.AuraOption(trow, values=["System", "Light", "Dark"],
+                                 width=110, height=30,
+                                 command=self._set_theme_pref)
+            th.set(cur.capitalize() if cur in ("light", "dark") else "System")
+            th.pack(side="left")
+            aura.Caption(dlg.body,
+                         "System follows the OS Aura Dark/Light live.").pack(
+                anchor="w", pady=(0, 14))
+
+            aura.SectionLabel(dlg.body, "History").pack(anchor="w",
+                                                        pady=(0, 2))
+            hrow = ctk.CTkFrame(dlg.body, fg_color="transparent")
+            hrow.pack(anchor="w", pady=(6, 0))
+            aura.AuraButton(hrow, "Clear recent archives", kind="secondary",
+                            height=30,
+                            command=lambda: (guiconfig.clear_recent(),
+                                             self._refresh_recent())).pack(
+                side="left")
+
+            dlg.add_button("Close")
+
+        def _set_theme_pref(self, choice):
+            pref = str(choice).lower()
+            if pref == "system":
+                guiconfig.set_theme("system")
+                self._follow_system = True
+                if self._sys_listener is None:
+                    self._start_system_listener()
+                self.set_theme(aura._system_theme(), _system=True)
+            elif pref in ("light", "dark"):
+                self.set_theme(pref)     # persists via on_theme_change
+
+        # ---- theme: keep the sidebar library rows in sync ------------------
+        def set_theme(self, theme, _system=False):
+            super().set_theme(theme, _system=_system)
+            try:
+                self._refresh_recent()
+            except Exception:
+                pass
+
+        # =================================================================
+        # About section
+        # =================================================================
+        def _build_about(self, frame):
+            card = aura.Card(frame, title="About ArchivePro")
+            card.pack(fill="x")
+            aura.Heading(card.body, APP_NAME).pack(anchor="w")
+            aura.Caption(card.body, f"Version {APP_VERSION}").pack(
+                anchor="w", pady=(0, 10))
+            ctk.CTkLabel(
+                card.body, font=aura.font(), justify="left", anchor="w",
+                wraplength=560,
+                text="A fast, fully-offline archiver — browse, extract, "
+                     "create and test ZIP, 7z, TAR (gz/bz2/xz), Zstandard "
+                     "and Gzip archives, with AES-256-encrypted 7z and "
+                     "split volumes.\n\n"
+                     "100% AI-built, open source, published on QuickOpen. "
+                     "Nothing is ever uploaded anywhere.").pack(anchor="w")
+            aura.Caption(card.body,
+                         "Shortcuts: Ctrl+O open · Ctrl+N new archive · "
+                         "Ctrl+F filter · Ctrl+, settings · Ctrl+\\ "
+                         "sidebar").pack(anchor="w", pady=(10, 0))
+            aura.Caption(card.body,
+                         "Licensed under Apache-2.0. Built on py7zr, "
+                         "zstandard and CustomTkinter (all permissive)."
+                         ).pack(anchor="w", pady=(10, 4))
+            aura.AuraButton(card.body, "Project page: quickopen.ai",
+                            kind="ghost",
+                            command=lambda: open_with_default_app(
+                                PROJECT_URL)).pack(anchor="w", pady=(6, 0))
 
         # =================================================================
         # Background op runner + status helpers
@@ -596,7 +806,10 @@ def build_app():
                     res, err = None, str(ex)
                 except Exception as ex:  # never leak a traceback
                     res, err = None, f"Unexpected error: {ex}"
-                self.after(0, lambda: finish(res, err))
+                try:
+                    self.after(0, lambda: finish(res, err))
+                except Exception:
+                    self._busy = False
 
             def finish(res, err):
                 self._busy = False
@@ -612,12 +825,6 @@ def build_app():
 
         def report_success(self, message, outputs=None):
             outputs = outputs or []
-            for o in outputs:
-                if o:
-                    try:
-                        guiconfig.add_recent(o)
-                    except Exception:
-                        pass
             if outputs:
                 first = outputs[0]
                 self._last_output_dir = (

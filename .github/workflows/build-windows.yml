@@ -22,6 +22,8 @@ jobs:
           --version-file packaging/version.txt
           --hidden-import archivepro.__main__
           --add-data "archive-pro.ico;."
+          --add-data "archive-pro.png;."
+          --add-data "assets;assets"
           --collect-all py7zr
           --collect-submodules zstandard
           --collect-all customtkinter

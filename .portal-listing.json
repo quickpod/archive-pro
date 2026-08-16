@@ -1,0 +1,4 @@
+{
+  "tagline": "A friendly 7-Zip-style archiver — browse, extract, create and test ZIP, 7z, TAR and more, fully offline",
+  "description": "ArchivePro handles everyday archives without the clutter: open a ZIP, 7z, TAR (gz/bz2/xz), Zstandard or Gzip file and see every entry with sizes and dates, filter the list, then extract everything or just your selection. Create new archives from files and folders with a suggested output name, optional AES-256-encrypted 7z, compression level, and split volumes — and verify any archive with one-click integrity testing. Recent archives stay one click away in the sidebar. Follows your OS light/dark theme live, with a Ctrl+, Settings dialog. Everything runs locally; nothing is ever uploaded. 100% AI-built and open source."
+}

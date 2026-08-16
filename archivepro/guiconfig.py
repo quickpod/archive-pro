@@ -1,7 +1,9 @@
 r"""Tiny JSON-backed config for the ArchivePro GUI.
 
-Stores just two things and never raises: the chosen theme ("light"/"dark") and a
-short list of recently opened archives.  On Windows the file lives at
+Stores just two things and never raises: the chosen theme ("system"/"light"/
+"dark" — "system" follows the OS Aura appearance live and is the fresh-install
+default) and a short list of recently opened archives.  ``ARCHIVEPRO_HOME``
+overrides the config directory (tests use this).  On Windows the file lives at
 ``%LOCALAPPDATA%\ArchivePro\config.json``; elsewhere it falls back to
 ``~/.archivepro/config.json``.  Every function is defensive -- a corrupt or
 unreadable config must never stop the app from starting.
@@ -15,11 +17,15 @@ import os
 APP_DIRNAME = "ArchivePro"
 CONFIG_NAME = "config.json"
 MAX_RECENT = 12
-VALID_THEMES = ("light", "dark")
+# "system" follows the OS Aura Dark/Light live (the fresh-install default).
+VALID_THEMES = ("system", "light", "dark")
 
 
 def config_dir():
     r"""``%LOCALAPPDATA%\ArchivePro`` on Windows, ``~/.archivepro`` otherwise."""
+    override = os.environ.get("ARCHIVEPRO_HOME")
+    if override:
+        return override
     local = os.environ.get("LOCALAPPDATA")
     if local and os.name == "nt":
         return os.path.join(local, APP_DIRNAME)
@@ -31,7 +37,7 @@ def config_path():
 
 
 def _defaults():
-    return {"theme": "dark", "recent": []}
+    return {"theme": "system", "recent": []}
 
 
 def load():
@@ -57,7 +63,7 @@ def save(cfg):
     try:
         os.makedirs(config_dir(), exist_ok=True)
         clean = {
-            "theme": cfg.get("theme") if cfg.get("theme") in VALID_THEMES else "dark",
+            "theme": cfg.get("theme") if cfg.get("theme") in VALID_THEMES else "system",
             "recent": [p for p in cfg.get("recent", []) if isinstance(p, str)][:MAX_RECENT],
         }
         tmp = config_path() + ".tmp"
@@ -69,7 +75,7 @@ def save(cfg):
 
 
 def get_theme():
-    return load().get("theme", "dark")
+    return load().get("theme", "system")
 
 
 def set_theme(theme):

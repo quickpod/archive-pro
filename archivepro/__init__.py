@@ -29,7 +29,7 @@ from .create import create
 from .extract import extract
 from .inspect import list_contents, test_archive
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "ArchiveError",
